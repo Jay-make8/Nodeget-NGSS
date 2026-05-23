@@ -1,3 +1,47 @@
+export interface HistorySample {
+  t: number
+  online: boolean
+  rate?: number | null  // 桶内在线率 0-1，仅 fetchUptimeHistory 返回
+  cpu: number | null
+  mem: number | null
+  disk: number | null
+  netIn: number
+  netOut: number
+}
+
+export interface TcpPingRecord {
+  t: number
+  cron: string
+  latency: number | null // null = 超时/丢包
+}
+
+export interface Node {
+  uuid: string
+  source: string
+  online: boolean
+  meta: NodeMeta
+  static: StaticData
+  dynamic: DynamicSummary | null
+  history: HistorySample[]
+  tcpPings: TcpPingRecord[]
+}
+
+
+export interface Usage {
+  cpu?: number
+  mem?: number
+  memUsed: number
+  memTotal: number
+  disk?: number
+  diskUsed: number
+  diskTotal: number
+  netIn?: number
+  netOut?: number
+  uptime?: number
+  ts?: number
+}
+
+
 export interface NodeMeta {
   name: string
   region: string

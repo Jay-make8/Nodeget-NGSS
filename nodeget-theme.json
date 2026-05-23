@@ -1,10 +1,10 @@
 {
-  "name": "NodeGet Basic Theme",
-  "short": "NodeGetBasic",
-  "description": "NodeGet Basic Theme - a boilerplate for custom themes",
+  "name": "NGSS",
+  "short": "NGSS",
+  "description": "NGSS Theme",
   "author": "NodeSeekDev",
-  "repository": "https://github.com/NodeSeekDev/NodeGet-StatusShow",
-  "dist_page": "https://nodeget.pages.dev",
+  "repository": "https://github.com/0xUnixIO/NGSS",
+  "dist_page": "",
   "user_preferences_form": {
     "version": "0.0.1",
     "items": [
@@ -19,7 +19,7 @@
         "key": "site_logo",
         "name": "站点图标",
         "type": "string",
-        "default": "",
+        "default": "/n-logo.svg",
         "help": "输入站点图标链接，留空则使用默认"
       },
       {

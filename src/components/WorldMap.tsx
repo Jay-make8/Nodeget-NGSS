@@ -1,410 +1,353 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import * as echarts from 'echarts'
-import { AlertTriangle, ChevronRight, X } from 'lucide-react'
-import { Card } from './ui/card'
-import { Flag } from './Flag'
-import { StatusDot } from './StatusDot'
-import { displayName, distroLogo } from '../utils/derive'
+import { memo, useMemo, useState } from 'react'
+import { ComposableMap, Geographies, Geography, Marker, ZoomableGroup } from 'react-simple-maps'
+import { feature } from 'topojson-client'
+import type { Topology, GeometryCollection } from 'topojson-specification'
+import { geoContains } from 'd3-geo'
+import worldAtlas from 'world-atlas/countries-110m.json'
+import { useTheme } from '../hooks/useTheme'
+import { cn } from '../utils/cn'
+import { resolveCoords } from '../utils/coords'
 import type { Node } from '../types'
 
-const MAP_W = 900
-const MAP_H = 520
-const TINY_DEG = 2
-const GEO_URL = `${import.meta.env.BASE_URL}world.geo.json`
+const geoFeatures = feature(
+  worldAtlas as unknown as Topology<{ countries: GeometryCollection }>,
+  (worldAtlas as unknown as Topology<{ countries: GeometryCollection }>).objects.countries,
+)
 
-const HEAT = [
-  [254, 215, 170],
-  [251, 146, 60],
-  [194, 65, 12],
-]
 
-const cnameMap = new Map<string, string>()
-const knownA2 = new Set<string>()
-const tinyCenter = new Map<string, [number, number]>()
-let mapPromise: Promise<void> | null = null
+interface Point {
+  uuid: string
+  name: string
+  region: string
+  lng: number
+  lat: number
+  online: boolean
+  cpu: number | null
+  mem: number | null
+  netIn: number
+  netOut: number
+  uptime: number | null
+}
 
-interface CountryEntry {
-  online: number
-  offline: number
+interface Cluster {
+  key: string
+  lat: number
+  lng: number
+  points: Point[]
+}
+
+interface ClusterTooltip {
+  cluster: Cluster
+  x: number
+  y: number
+}
+
+interface GeoTooltip {
+  name: string
+  x: number
+  y: number
+}
+
+const LIGHT = {
+  bg: '#b0c4d8',
+  fill: '#cfdce8',
+  fillHover: '#b8ccda',
+  stroke: 'rgba(70,95,115,0.4)',
+  nodeCountry: '#6ee7b7',
+  nodeCountryHover: '#34d399',
+}
+
+const DARK = {
+  bg: '#060d1a',
+  fill: '#11324a',
+  fillHover: '#1e4f6d',
+  stroke: 'rgba(103,232,249,0.2)',
+}
+
+// 节点数 → 绿色深度（count/max 归一化到 0-1，线性插值 hex）
+function lerpHex(a: string, b: string, t: number): string {
+  const p = (s: string, i: number) => parseInt(s.slice(i, i + 2), 16)
+  const r = Math.round(p(a, 1) + (p(b, 1) - p(a, 1)) * t)
+  const g = Math.round(p(a, 3) + (p(b, 3) - p(a, 3)) * t)
+  const bl = Math.round(p(a, 5) + (p(b, 5) - p(a, 5)) * t)
+  return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${bl.toString(16).padStart(2, '0')}`
+}
+
+function nodeCountryColor(count: number, max: number, dark: boolean, hover = false): string {
+  const t = max <= 1 ? 1 : (count - 1) / (max - 1)
+  if (dark) {
+    const fill = lerpHex('#065f46', '#10b981', t)   // emerald-800 → emerald-500
+    const h = lerpHex('#047857', '#34d399', t)
+    return hover ? h : fill
+  }
+  const fill = lerpHex('#a7f3d0', '#059669', t)     // emerald-200 → emerald-600
+  const h = lerpHex('#6ee7b7', '#047857', t)
+  return hover ? h : fill
+}
+
+function formatUptime(seconds: number) {
+  const d = Math.floor(seconds / 86400)
+  const h = Math.floor((seconds % 86400) / 3600)
+  if (d > 0) return `${d}d ${h}h`
+  const m = Math.floor((seconds % 3600) / 60)
+  if (h > 0) return `${h}h ${m}m`
+  return `${m}m`
+}
+
+export const WorldMap = memo(function WorldMap({
+  nodes,
+  onSelect,
+}: {
   nodes: Node[]
-}
+  onSelect: (uuid: string) => void
+}) {
+  const { theme } = useTheme()
+  const c = theme === 'dark' ? DARK : LIGHT
 
-interface Props {
-  nodes: Node[]
-  onOpen?: (uuid: string) => void
-}
+  const [clusterTooltip, setClusterTooltip] = useState<ClusterTooltip | null>(null)
+  const [geoTooltip, setGeoTooltip] = useState<GeoTooltip | null>(null)
+  const [picker, setPicker] = useState<{ cluster: Cluster; x: number; y: number } | null>(null)
+  const [zoom, setZoom] = useState(1)
 
-function ringBbox(ring: number[][]) {
-  let minLng = Infinity
-  let maxLng = -Infinity
-  let minLat = Infinity
-  let maxLat = -Infinity
-  for (const [lng, lat] of ring) {
-    if (lng < minLng) minLng = lng
-    if (lng > maxLng) maxLng = lng
-    if (lat < minLat) minLat = lat
-    if (lat > maxLat) maxLat = lat
-  }
-  return { minLng, maxLng, minLat, maxLat, w: maxLng - minLng, h: maxLat - minLat }
-}
 
-function tinyMeta(geometry: any): { center: [number, number]; size: number } | null {
-  if (!geometry?.coordinates) return null
-  const polygons = geometry.type === 'MultiPolygon' ? geometry.coordinates : [geometry.coordinates]
-  let best: ReturnType<typeof ringBbox> | null = null
-  let bestArea = -1
-  for (const poly of polygons) {
-    const outer = poly[0]
-    if (!outer) continue
-    const bb = ringBbox(outer)
-    const area = bb.w * bb.h
-    if (area > bestArea) {
-      bestArea = area
-      best = bb
-    }
-  }
-  if (!best) return null
-  return {
-    center: [(best.minLng + best.maxLng) / 2, (best.minLat + best.maxLat) / 2],
-    size: Math.max(best.w, best.h),
-  }
-}
-
-function heatColor(t: number) {
-  const x = Math.min(1, Math.max(0, t))
-  const seg = x >= 0.5 ? 1 : 0
-  const f = (x - seg * 0.5) * 2
-  const a = HEAT[seg]
-  const b = HEAT[seg + 1]
-  const r = Math.round(a[0] + (b[0] - a[0]) * f)
-  const g = Math.round(a[1] + (b[1] - a[1]) * f)
-  const c = Math.round(a[2] + (b[2] - a[2]) * f)
-  return `rgb(${r},${g},${c})`
-}
-
-function ensureMap() {
-  if (!mapPromise) {
-    mapPromise = fetch(GEO_URL)
-      .then(r => r.json())
-      .then(geo => {
-        for (const f of geo.features ?? []) {
-          const a2 = f.properties?.name
-          if (!a2) continue
-          knownA2.add(a2)
-          if (f.properties?.cname) cnameMap.set(a2, f.properties.cname)
-          const m = tinyMeta(f.geometry)
-          if (m && m.size < TINY_DEG) tinyCenter.set(a2, m.center)
-        }
-        echarts.registerMap('world', geo)
+  const points = useMemo<Point[]>(() => {
+    const out: Point[] = []
+    for (const node of nodes) {
+      const coords = resolveCoords(node.meta ?? undefined)
+      if (!coords) continue
+      const [lng, lat] = coords
+      const d = node.dynamic
+      const memPct = d?.used_memory && d?.total_memory
+        ? d.used_memory / d.total_memory * 100
+        : null
+      out.push({
+        uuid: node.uuid,
+        name: node.meta.name || node.uuid.slice(0, 8),
+        region: node.meta.region || '',
+        lat,
+        lng,
+        online: node.online,
+        cpu: d?.cpu_usage ?? null,
+        mem: memPct,
+        netIn: d?.receive_speed ?? 0,
+        netOut: d?.transmit_speed ?? 0,
+        uptime: d?.uptime ?? null,
       })
-      .catch(err => {
-        mapPromise = null
-        throw err
-      })
-  }
-  return mapPromise
-}
-
-export function WorldMap({ nodes, onOpen }: Props) {
-  const [ready, setReady] = useState(false)
-  const [error, setError] = useState<Error | null>(null)
-  const [pickedA2, setPickedA2] = useState<string | null>(null)
-  const [renderA2, setRenderA2] = useState<string | null>(null)
-  const wrapRef = useRef<HTMLDivElement | null>(null)
-  const chartRef = useRef<echarts.ECharts | null>(null)
-
-  useEffect(() => {
-    let cancelled = false
-    ensureMap()
-      .then(() => {
-        if (!cancelled) setReady(true)
-      })
-      .catch(err => {
-        if (!cancelled) setError(err instanceof Error ? err : new Error(String(err)))
-      })
-    return () => {
-      cancelled = true
     }
-  }, [])
-
-  useEffect(() => {
-    if (pickedA2) {
-      setRenderA2(pickedA2)
-    } else if (renderA2) {
-      const t = window.setTimeout(() => setRenderA2(null), 160)
-      return () => clearTimeout(t)
-    }
-  }, [pickedA2, renderA2])
-
-  const { byCountry, total } = useMemo(() => {
-    const map = new Map<string, CountryEntry>()
-    let total = 0
-    for (const n of nodes) {
-      const a2 = n.meta?.region?.trim().toUpperCase()
-      if (!a2 || !/^[A-Z]{2}$/.test(a2)) continue
-      total++
-      const e = map.get(a2) || { online: 0, offline: 0, nodes: [] }
-      if (n.online) e.online++
-      else e.offline++
-      e.nodes.push(n)
-      map.set(a2, e)
-    }
-    return { byCountry: map, total }
+    return out
   }, [nodes])
 
-  const dataSig = useMemo(
-    () =>
-      [...byCountry.entries()]
-        .map(([k, v]) => `${k}:${v.online}/${v.offline}`)
-        .sort()
-        .join(','),
-    [byCountry],
-  )
+  const clusters = useMemo<Cluster[]>(() => {
+    // 球面近似距离（度），zoom=1 时阈值 ~10°（约 1000km），随缩放等比缩小
+    const threshold = 10 / zoom
+    const assigned = new Set<string>()
+    const result: Cluster[] = []
 
-  const liveRef = useRef({ byCountry, onOpen })
-  useEffect(() => {
-    liveRef.current = { byCountry, onOpen }
-  })
+    for (const p of points) {
+      if (assigned.has(p.uuid)) continue
+      const group: Point[] = [p]
+      assigned.add(p.uuid)
 
-  const option = useMemo(() => buildOption(byCountry), [dataSig])
+      for (const q of points) {
+        if (assigned.has(q.uuid)) continue
+        const avgLat = ((p.lat + q.lat) / 2) * (Math.PI / 180)
+        const dlat = p.lat - q.lat
+        const dlng = (p.lng - q.lng) * Math.cos(avgLat)
+        if (Math.sqrt(dlat * dlat + dlng * dlng) < threshold) {
+          group.push(q)
+          assigned.add(q.uuid)
+        }
+      }
 
-  useEffect(() => {
-    if (!ready || !wrapRef.current) return
-    if (!chartRef.current) {
-      chartRef.current = echarts.init(wrapRef.current)
-      chartRef.current.on('click', (p: any) => {
-        const cur = liveRef.current
-        const e = cur.byCountry.get(p.name)
-        if (!e) return
-        if (e.nodes.length === 1) cur.onOpen?.(e.nodes[0].uuid)
-        else setPickedA2(p.name)
+      result.push({
+        key: p.uuid,
+        lat: group.reduce((s, pt) => s + pt.lat, 0) / group.length,
+        lng: group.reduce((s, pt) => s + pt.lng, 0) / group.length,
+        points: group,
       })
     }
-    chartRef.current.setOption(option, false)
-  }, [ready, option])
+    return result
+  }, [points, zoom])
 
-  useEffect(() => {
-    if (!ready || !chartRef.current) return
-    const ro = new ResizeObserver(() => chartRef.current?.resize())
-    if (wrapRef.current) ro.observe(wrapRef.current)
-    return () => ro.disconnect()
-  }, [ready])
-
-  useEffect(() => {
-    return () => {
-      chartRef.current?.dispose()
-      chartRef.current = null
-    }
-  }, [])
-
-  const renderEntry = renderA2 ? byCountry.get(renderA2) ?? null : null
-
-  return (
-    <Card className="p-3 sm:p-4">
-      <div className="flex items-center mb-3 px-1">
-        <div className="text-sm font-semibold text-foreground/90">地理位置</div>
-      </div>
-
-      <div
-        className="relative w-full overflow-hidden rounded-md border border-border/60 bg-[hsl(220_15%_8%)]"
-        style={{ aspectRatio: `${MAP_W} / ${MAP_H}` }}
-      >
-        <div ref={wrapRef} className="absolute inset-0" />
-
-        {error && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-4 text-center text-sm text-white/80">
-            <AlertTriangle className="h-5 w-5 text-amber-400" />
-            <div>地图加载失败</div>
-            <div className="text-xs text-white/50 break-all">{error.message}</div>
-          </div>
-        )}
-
-        {!error && ready && total === 0 && (
-          <div className="absolute inset-0 flex items-center justify-center text-sm text-white/55 pointer-events-none">
-            没有节点设置过国家代码
-          </div>
-        )}
-
-        {renderEntry && renderA2 && (
-          <NodePopover
-            a2={renderA2}
-            entry={renderEntry}
-            open={pickedA2 === renderA2}
-            onPick={uuid => {
-              setPickedA2(null)
-              onOpen?.(uuid)
-            }}
-            onClose={() => setPickedA2(null)}
-          />
-        )}
-
-        <div className="absolute bottom-3 right-4 z-10 font-mono text-sm font-semibold tracking-wider text-white/85 pointer-events-none uppercase">
-          {total} nodes
-        </div>
-      </div>
-    </Card>
-  )
-}
-
-function buildOption(byCountry: Map<string, CountryEntry>) {
-  const entries = [...byCountry.entries()].filter(([a2]) => knownA2.has(a2))
-  const data = entries.map(([a2, e]) => ({ name: a2, value: e.online + e.offline }))
-  const max = data.reduce((m, d) => Math.max(m, d.value), 0)
-  const tinyMarkers = entries
-    .map(([a2, e]) => {
-      const c = tinyCenter.get(a2)
-      if (!c) return null
-      const v = e.online + e.offline
-      const t = max > 0 ? v / max : 0
-      return {
-        name: a2,
-        coord: c,
-        value: v,
-        symbolSize: 6 + Math.min(8, Math.log2(v + 1) * 3),
-        itemStyle: {
-          color: heatColor(0.35 + 0.65 * t),
-          borderColor: 'rgba(20,22,28,0.85)',
-          borderWidth: 0.8,
-          shadowBlur: 8,
-          shadowColor: 'rgba(251,146,60,0.45)',
-        },
+  // 统计每个国家的节点数，仅当 lat/lng 发生变化时重算
+  const posKey = points.map(p => `${p.uuid}:${p.lat},${p.lng}`).join('|')
+  const nodeCountryCounts = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const point of points) {
+      for (const geo of geoFeatures.features) {
+        if (geoContains(geo, [point.lng, point.lat])) {
+          const id = String(geo.id)
+          counts.set(id, (counts.get(id) ?? 0) + 1)
+          break
+        }
       }
-    })
-    .filter((x): x is NonNullable<typeof x> => x != null)
+    }
+    return counts
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [posKey])
 
-  return {
-    backgroundColor: 'transparent',
-    visualMap: {
-      type: 'continuous' as const,
-      min: 1,
-      max: Math.max(max, 1),
-      show: max > 0,
-      seriesIndex: 0,
-      left: 16,
-      bottom: 16,
-      itemWidth: 10,
-      itemHeight: 90,
-      orient: 'horizontal' as const,
-      text: ['多', '少'],
-      textStyle: { color: 'rgba(255,255,255,0.55)', fontSize: 10 },
-      inRange: { color: ['#fed7aa', '#fb923c', '#c2410c'] },
-      outOfRange: { color: 'rgba(148,163,184,0.16)' },
-      calculable: false,
-    },
-    tooltip: {
-      trigger: 'item' as const,
-      backgroundColor: 'rgba(20,22,28,0.94)',
-      borderColor: 'rgba(148,163,184,0.3)',
-      borderWidth: 1,
-      padding: [6, 10] as [number, number],
-      textStyle: { color: '#e5e7eb', fontSize: 12 },
-      formatter: (p: any) => {
-        const a2 = p.name
-        const cname = cnameMap.get(a2)
-        const head = cname ? `${cname} <span style="color:#94a3b8">${a2}</span>` : a2
-        const e = byCountry.get(a2)
-        if (!e) return `<b>${head}</b><br/><span style="color:#94a3b8">无节点</span>`
-        const offline = e.offline
-          ? ` <span style="color:#94a3b8">· ${e.offline} 离线</span>`
-          : ''
-        return `<b>${head}</b><br/>${e.online + e.offline} 节点 <span style="color:#34d399">· ${e.online} 在线</span>${offline}`
-      },
-    },
-    series: [
-      {
-        type: 'map' as const,
-        map: 'world',
-        roam: false,
-        zoom: 1.15,
-        layoutCenter: ['50%', '50%'] as [string, string],
-        layoutSize: '100%',
-        selectedMode: false,
-        itemStyle: {
-          areaColor: 'rgba(148,163,184,0.16)',
-          borderColor: 'rgba(148,163,184,0.32)',
-          borderWidth: 0.4,
-        },
-        emphasis: {
-          label: { show: false },
-          itemStyle: { areaColor: '#fb923c' },
-        },
-        label: { show: false },
-        data,
-        markPoint: {
-          symbol: 'circle',
-          label: { show: false },
-          emphasis: { label: { show: false }, scale: 1.3 },
-          data: tinyMarkers,
-        },
-      },
-    ],
-  }
-}
+  const maxCount = useMemo(
+    () => Math.max(1, ...nodeCountryCounts.values()),
+    [nodeCountryCounts],
+  )
 
-function NodePopover({
-  a2,
-  entry,
-  open,
-  onPick,
-  onClose,
-}: {
-  a2: string
-  entry: CountryEntry
-  open: boolean
-  onPick: (uuid: string) => void
-  onClose: () => void
-}) {
-  const cname = cnameMap.get(a2) || a2
+  const center = useMemo<[number, number]>(() => {
+    if (points.length === 0) return [0, 20]
+    const avgLng = points.reduce((s, p) => s + p.lng, 0) / points.length
+    const avgLat = Math.max(-50, Math.min(65, points.reduce((s, p) => s + p.lat, 0) / points.length))
+    return [avgLng, avgLat]
+  }, [points])
+
   return (
     <div
-      data-state={open ? 'open' : 'closed'}
-      className="absolute right-3 top-3 z-20 w-64 rounded-lg border border-border bg-popover text-popover-foreground shadow-xl overflow-hidden origin-top-right duration-150 fill-mode-forwards data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95"
-      onClick={e => e.stopPropagation()}
-      onMouseDown={e => e.stopPropagation()}
+      className="relative w-full h-full overflow-hidden"
+      style={{ background: c.bg }}
     >
-      <div key={a2} className="animate-in fade-in-0 duration-100 fill-mode-forwards">
-        <div className="flex items-center gap-2 px-3 py-2.5 border-b border-border/70">
-          <Flag code={a2} className="shrink-0" />
-          <div className="flex-1 min-w-0">
-            <div className="text-sm font-semibold truncate leading-tight">{cname}</div>
-            <div className="text-[11px] text-muted-foreground font-mono mt-0.5">
-              <span className="text-emerald-500">{entry.online} 在线</span>
-              {entry.offline > 0 && <span className="ml-2">{entry.offline} 离线</span>}
-            </div>
-          </div>
-          <button
-            onClick={onClose}
-            aria-label="关闭"
-            className="-mr-1 h-6 w-6 inline-flex items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-accent shrink-0"
-          >
-            <X className="h-3.5 w-3.5" />
-          </button>
-        </div>
-        <div className="max-h-72 overflow-auto py-1">
-          {entry.nodes.map(n => {
-            const logo = distroLogo(n)
-            return (
-              <button
-                key={n.uuid}
-                onClick={() => onPick(n.uuid)}
-                className="group w-full flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-accent text-left transition-colors"
-              >
-                <StatusDot online={n.online} className="w-1.5 h-1.5 ring-1" />
-                {logo && (
-                  <img
-                    src={logo}
-                    alt=""
-                    className="w-3.5 h-3.5 shrink-0 object-contain opacity-80"
-                    loading="lazy"
+
+      <ComposableMap
+        projection="geoMercator"
+        projectionConfig={{ scale: 140, center }}
+        style={{ width: '100%', height: '100%' }}
+      >
+        <ZoomableGroup zoom={1} minZoom={0.5} maxZoom={8} onMoveEnd={({ zoom: z }) => setZoom(z)}>
+          <Geographies geography={geoFeatures}>
+            {({ geographies }) =>
+              geographies.map(geo => {
+                const count = nodeCountryCounts.get(String(geo.id)) ?? 0
+                const isDark = theme === 'dark'
+                const name = (geo.properties as { name?: string }).name ?? ''
+                return (
+                  <Geography
+                    key={geo.rsmKey}
+                    geography={geo}
+                    fill={count > 0 ? nodeCountryColor(count, maxCount, isDark) : c.fill}
+                    stroke={c.stroke}
+                    strokeWidth={0.5}
+                    style={{
+                      default: { outline: 'none' },
+                      hover: { fill: count > 0 ? nodeCountryColor(count, maxCount, isDark, true) : c.fillHover, outline: 'none' },
+                      pressed: { outline: 'none' },
+                    }}
+                    onMouseEnter={(e: React.MouseEvent) =>
+                      setGeoTooltip({ name, x: e.clientX, y: e.clientY })
+                    }
+                    onMouseMove={(e: React.MouseEvent) =>
+                      setGeoTooltip(prev => prev ? { ...prev, x: e.clientX, y: e.clientY } : null)
+                    }
+                    onMouseLeave={() => setGeoTooltip(null)}
                   />
+                )
+              })
+            }
+          </Geographies>
+
+          {clusters.map(cluster => {
+            const hovered = clusterTooltip?.cluster.key === cluster.key
+            const isMulti = cluster.points.length > 1
+            const allOnline = cluster.points.every(p => p.online)
+            const anyOnline = cluster.points.some(p => p.online)
+            const fill = allOnline ? '#10b981' : anyOnline ? '#f59e0b' : '#f43f5e'
+            const stroke = allOnline ? '#d1fae5' : anyOnline ? '#fef3c7' : '#fecdd3'
+            const r = hovered ? (isMulti ? 10 : 8) : (isMulti ? 7 : 5)
+            const sw = hovered ? 2.5 : 1.5
+            return (
+              <Marker
+                key={cluster.key}
+                coordinates={[cluster.lng, cluster.lat]}
+                onClick={(e: React.MouseEvent) => {
+                  if (!isMulti) {
+                    onSelect(cluster.points[0].uuid)
+                  } else {
+                    setClusterTooltip(null)
+                    setPicker({ cluster, x: e.clientX, y: e.clientY })
+                  }
+                }}
+                onMouseEnter={(e: React.MouseEvent) => {
+                  setGeoTooltip(null)
+                  setClusterTooltip({ cluster, x: e.clientX, y: e.clientY })
+                }}
+                onMouseMove={(e: React.MouseEvent) =>
+                  setClusterTooltip(prev => prev ? { ...prev, x: e.clientX, y: e.clientY } : null)
+                }
+                onMouseLeave={() => setClusterTooltip(null)}
+              >
+                <circle
+                  r={r}
+                  fill={fill}
+                  stroke={stroke}
+                  strokeWidth={sw}
+                  style={{ cursor: 'pointer', transition: 'r 0.15s ease' }}
+                />
+                {isMulti && (
+                  <text
+                    textAnchor="middle"
+                    dy=".35em"
+                    fontSize={r * 0.85}
+                    fill="white"
+                    style={{ pointerEvents: 'none', fontWeight: 'bold', userSelect: 'none' }}
+                  >
+                    {cluster.points.length}
+                  </text>
                 )}
-                <span className="truncate flex-1 text-foreground/90">{displayName(n)}</span>
-                <ChevronRight className="h-3 w-3 text-muted-foreground/40 shrink-0 transition-transform group-hover:translate-x-0.5 group-hover:text-muted-foreground" />
-              </button>
+              </Marker>
             )
           })}
+        </ZoomableGroup>
+      </ComposableMap>
+
+      {points.length === 0 && (
+        <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground pointer-events-none">
+          没有节点设置了经纬度坐标
         </div>
-      </div>
+      )}
+
+      {/* 国家名 tooltip */}
+      {geoTooltip && !clusterTooltip && (
+        <div
+          className="pointer-events-none fixed z-50 rounded-md border bg-popover px-2 py-1 text-xs text-popover-foreground shadow-md"
+          style={{ left: geoTooltip.x + 12, top: geoTooltip.y + 8 }}
+        >
+          {geoTooltip.name || '—'}
+        </div>
+      )}
+
+      {/* 节点 tooltip：只显示名字 */}
+      {clusterTooltip && (
+        <div
+          className="pointer-events-none fixed z-50 rounded-md border bg-popover px-2.5 py-1.5 text-xs text-popover-foreground shadow-md"
+          style={{ left: clusterTooltip.x + 14, top: clusterTooltip.y + 8 }}
+        >
+          {clusterTooltip.cluster.points.map((point, i) => (
+            <div key={point.uuid} className={cn('flex items-center gap-1.5', i > 0 && 'mt-1')}>
+              <span className={point.online ? 'text-emerald-500' : 'text-rose-500'}>●</span>
+              <span className="font-medium">{point.name}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {/* 多节点 picker */}
+      {picker && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setPicker(null)} />
+          <div
+            className="fixed z-50 rounded-lg border bg-popover shadow-lg overflow-hidden text-xs text-popover-foreground"
+            style={{ left: picker.x + 8, top: picker.y + 8 }}
+          >
+            {picker.cluster.points.map(point => (
+              <button
+                key={point.uuid}
+                type="button"
+                className="flex items-center gap-2 w-full px-3 py-2 hover:bg-accent text-left transition-colors"
+                onClick={() => { onSelect(point.uuid); setPicker(null) }}
+              >
+                <span className={point.online ? 'text-emerald-500' : 'text-rose-400'}>●</span>
+                <span className="font-medium">{point.name}</span>
+                {point.region && <span className="text-muted-foreground ml-1">{point.region}</span>}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
     </div>
   )
-}
+})

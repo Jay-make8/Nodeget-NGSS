@@ -1,159 +1,165 @@
-const CONNECT_TIMEOUT_MS = 8000
-const RECONNECT_DELAY_MS = 2000
-const CALL_TIMEOUT_MS = 10000
+import { Client } from 'rpc-websockets'
 
-const DEBUG = import.meta.env.DEV
-const log = (name: string, ...args: unknown[]) => {
-  if (DEBUG) console.log(`%c[rpc ${name}]`, 'color:#06b6d4', ...args)
-}
-const warn = (name: string, ...args: unknown[]) => {
-  if (DEBUG) console.warn(`[rpc ${name}]`, ...args)
-}
+const CONNECT_TIMEOUT_MS = 8000
 
 let seq = 0
-const nextId = () => `${++seq}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`
+const nextRequestId = () =>
+  `${++seq}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`
 
-interface Pending {
-  method: string
-  sentAt: number
-  resolve: (v: unknown) => void
-  reject: (e: Error) => void
-  timer: ReturnType<typeof setTimeout>
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnyHandler = (data: any) => void
+
+/** rpc-websockets Client 含 subscribe/unsubscribe 的完整接口（类型声明在 bundler 模式下解析有限，用接口补全） */
+interface RpcWebSocketClient {
+  call(method: string, params?: Record<string, unknown> | unknown[], timeout?: number): Promise<unknown>
+  on(event: string, handler: AnyHandler): void
+  once(event: string, handler: AnyHandler): void
+  off(event: string, handler: AnyHandler): void
+  close(code?: number, data?: string): void
+}
+
+/**
+ * 表示一个已建立的 jsonrpsee subscription，重连后需要用这些信息重新建立
+ */
+interface SubscriptionState {
+  subscribeMethod: string
+  unsubscribeMethod: string
+  /** 用户传入的原始 handler */
+  userHandler: AnyHandler
+  /** rpc-websockets 上注册的包装 handler（处理 {subscription, result} 解包 + sub_id 过滤）*/
+  wrappedHandler: AnyHandler
+  /** 当前 subscription id（重连后会更新）*/
+  subId: unknown
 }
 
 export class RpcClient {
-  private url: string
   private token: string
-  private name: string
-  private ws: WebSocket | null = null
-  private pending = new Map<string, Pending>()
-  private outbox: string[] = []
-  private closed = false
+  private client: RpcWebSocketClient
   opened: Promise<void>
+  /** 活跃的 subscription 状态列表，重连时遍历重新建立 */
+  private subs: SubscriptionState[] = []
+  private firstOpen = true
 
-  constructor(url: string, token: string, name?: string) {
-    this.url = url
+  constructor(url: string, token: string) {
     this.token = token
-    this.name = name || url
+    this.client = new Client(
+      url,
+      {
+        autoconnect: true,
+        reconnect: true,
+        reconnect_interval: 2000,
+        max_reconnects: Number.POSITIVE_INFINITY,
+      },
+      nextRequestId,
+    ) as unknown as RpcWebSocketClient
 
     this.opened = new Promise<void>((resolve, reject) => {
-      let done = false
-      const ok = () => {
-        if (done) return
-        done = true
+      const cleanup = () => {
+        clearTimeout(timer)
+        this.client.off('open', onOpen)
+        this.client.off('error', onError)
+      }
+      const onOpen = () => {
+        cleanup()
         resolve()
       }
-      const fail = (msg: string) => {
-        if (done) return
-        done = true
-        reject(new Error(msg))
+      const onError = (e: Error) => {
+        cleanup()
+        reject(new Error(`无法连接 ${url}: ${e?.message || 'WebSocket error'}`))
       }
-      this.connect(ok, fail)
-    })
-  }
-
-  private connect(ok: () => void, fail: (msg: string) => void) {
-    if (this.closed) return
-    const t0 = performance.now()
-    log(this.name, 'connecting →', this.url)
-
-    const ws = new WebSocket(this.url)
-    this.ws = ws
-    let opened = false
-
-    const timer = setTimeout(() => {
-      if (opened) return
-      ws.close()
-      fail(`连接 ${this.url} 超时`)
-    }, CONNECT_TIMEOUT_MS)
-
-    ws.onopen = () => {
-      opened = true
-      clearTimeout(timer)
-      log(this.name, `open in ${(performance.now() - t0).toFixed(0)}ms (flush ${this.outbox.length})`)
-      ok()
-      for (const m of this.outbox) ws.send(m)
-      this.outbox = []
-    }
-
-    ws.onmessage = e => {
-      const data = typeof e.data === 'string' ? e.data : String(e.data)
-      let msg: { id?: string | number | null; result?: unknown; error?: { code?: number; message?: string } }
-      try { msg = JSON.parse(data) } catch { return }
-      if (msg.id == null) return
-      const id = String(msg.id)
-      const p = this.pending.get(id)
-      if (!p) return
-      this.pending.delete(id)
-      clearTimeout(p.timer)
-      const dt = (performance.now() - p.sentAt).toFixed(0)
-      if (msg.error) {
-        warn(this.name, `← ${p.method} (${dt}ms) error`, msg.error)
-        p.reject(new Error(msg.error.message || 'rpc error'))
-      } else {
-        log(this.name, `← ${p.method} ${dt}ms ${data.length}B (pending=${this.pending.size})`)
-        p.resolve(msg.result)
-      }
-    }
-
-    ws.onclose = ev => {
-      clearTimeout(timer)
-      this.ws = null
-      if (!opened) {
-        warn(this.name, `close before open code=${ev.code}`)
-        fail(`无法连接 ${this.url}`)
-      } else {
-        log(this.name, `close code=${ev.code} pending=${this.pending.size}`)
-      }
-      if (!this.closed) setTimeout(() => this.connect(ok, fail), RECONNECT_DELAY_MS)
-    }
-
-    ws.onerror = () => warn(this.name, 'ws error')
-  }
-
-  async call<T = unknown>(
-    method: string,
-    params: Record<string, unknown> = {},
-    timeout = CALL_TIMEOUT_MS,
-  ): Promise<T> {
-    await this.opened
-    const id = nextId()
-    const payload = JSON.stringify({
-      jsonrpc: '2.0',
-      method,
-      params: { token: this.token, ...params },
-      id,
-    })
-    const queued = this.ws?.readyState !== WebSocket.OPEN
-    log(this.name, `→ ${method} ${queued ? '(queued)' : ''} ${payload.length}B`)
-
-    return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pending.delete(id)
-        warn(this.name, `× ${method} timeout ${timeout}ms`)
-        reject(new Error(`${method} 超时`))
-      }, timeout)
-      this.pending.set(id, {
-        method,
-        sentAt: performance.now(),
-        resolve: resolve as (v: unknown) => void,
-        reject,
-        timer,
-      })
-      if (queued) this.outbox.push(payload)
-      else this.ws!.send(payload)
+        cleanup()
+        reject(new Error(`连接 ${url} 超时`))
+      }, CONNECT_TIMEOUT_MS)
+      this.client.once('open', onOpen)
+      this.client.once('error', onError)
     })
+
+    // 监听重连 open 事件，自动恢复所有 jsonrpsee subscription
+    this.client.on('open', () => {
+      if (this.firstOpen) {
+        this.firstOpen = false
+        return
+      }
+      for (const sub of this.subs) {
+        // 重新调用订阅 RPC 拿新的 sub_id，并替换旧 id
+        this.client
+          .call(sub.subscribeMethod, { token: this.token })
+          .then(newId => {
+            sub.subId = newId
+          })
+          .catch(e => console.warn(`[RpcClient] 重连后 re-subscribe "${sub.subscribeMethod}" 失败:`, e))
+      }
+    })
+  }
+
+  async call<T = unknown>(method: string, params: Record<string, unknown> = {}, timeout = 10000) {
+    await this.opened
+    return this.client.call(method, { token: this.token, ...params }, timeout) as Promise<T>
+  }
+
+  /**
+   * 订阅 jsonrpsee 服务端推送事件。
+   *
+   * 协议说明：
+   * - 客户端调用 `subscribeMethod` RPC，服务端返回 sub_id
+   * - 服务端后续推送的 notification 形如：
+   *   `{ jsonrpc, method: "<subscribeMethod>", params: { subscription: <sub_id>, result: <T> } }`
+   *   （rpc-websockets 会基于 `method` 字段 emit 事件，所以可以用 `on(subscribeMethod, ...)` 接收）
+   * - 取消订阅时调用 `unsubscribeMethod` RPC，并传入 sub_id
+   *
+   * @param subscribeMethod jsonrpsee 订阅 RPC 完整方法名（含命名空间前缀，如 `agent_subscribe_dynamic_summary`）
+   * @param unsubscribeMethod jsonrpsee 取消订阅 RPC 完整方法名
+   * @param handler 事件回调，参数为推送的 item 对象
+   * @returns 取消订阅函数
+   */
+  async subscribe<T>(
+    subscribeMethod: string,
+    unsubscribeMethod: string,
+    handler: (data: T) => void,
+  ): Promise<() => Promise<void>> {
+    await this.opened
+
+    const state: SubscriptionState = {
+      subscribeMethod,
+      unsubscribeMethod,
+      userHandler: handler as AnyHandler,
+      // 包装：从 jsonrpsee notification params 中解出 `result` 字段，再按 sub_id 过滤
+      wrappedHandler: (params: unknown) => {
+        if (!params || typeof params !== 'object') return
+        const p = params as { subscription?: unknown; result?: T }
+        // 同一连接上可能有多个相同 method 的订阅，按 sub_id 过滤
+        if (p.subscription !== state.subId) return
+        if (p.result !== undefined) handler(p.result)
+      },
+      subId: undefined,
+    }
+
+    // 注册 notification 监听（事件名 = 订阅 RPC 方法名）
+    this.client.on(subscribeMethod, state.wrappedHandler)
+
+    // 调用 jsonrpsee 订阅 RPC，拿到 sub_id
+    const subId = await this.client.call(subscribeMethod, { token: this.token })
+    state.subId = subId
+
+    this.subs.push(state)
+
+    // 返回取消订阅函数
+    return async () => {
+      this.client.off(subscribeMethod, state.wrappedHandler)
+      const idx = this.subs.indexOf(state)
+      if (idx !== -1) this.subs.splice(idx, 1)
+      try {
+        // jsonrpsee unsubscribe 参数形式为 { subscription: <sub_id> }
+        // 参考 NodeGet-board/src/composables/useLogs.ts 中已验证的协议
+        await this.client.call(unsubscribeMethod, { subscription: state.subId })
+      } catch (e) {
+        console.warn(`[RpcClient] unsubscribe "${unsubscribeMethod}" 失败:`, e)
+      }
+    }
   }
 
   close() {
-    this.closed = true
-    for (const p of this.pending.values()) {
-      clearTimeout(p.timer)
-      p.reject(new Error('connection closed'))
-    }
-    this.pending.clear()
-    this.outbox = []
-    this.ws?.close()
-    this.ws = null
+    this.client.close()
   }
 }
