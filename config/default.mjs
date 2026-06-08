@@ -10,8 +10,8 @@ import pkg from '../package.json' with { type: 'json' }
 export const defaultSiteTokens = [
     {
         "name": "master server node 1",
-        "backend_url": "wss://your-backend.example.com",
-        "token": "YOUR_TOKEN_HERE"
+        "backend_url": "wss://nodeget.waliey.com/nodeget/rpc",
+        "token": "s3xi9QwPkFNc0YeI:e6FzkYuVXjIiZGppKH5tNRSWVGtcobtf"
     }
 ]
 
