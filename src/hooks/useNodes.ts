@@ -431,12 +431,14 @@ export function useNodes(config: SiteConfig | null) {
     if (firstBackendUrl) {
       recordVisit(firstBackendUrl)
     }
+    /*
     subscribeVisitorStats(pool.entries[0].client, stats => {
       if (myRankRef.current == null) myRankRef.current = stats.today_uv
       setVisitorStats({ ...stats, today_rank: myRankRef.current })
     })
       .then(unsub => unsubscribeFns.push(unsub))
       .catch(e => console.warn('[useNodes] subscribeVisitorStats 失败:', e))
+      */
 
     return () => {
       ac.abort()
