@@ -9,7 +9,7 @@ export function useThemeConfig() {
     let alive = true
     if(!import.meta.env.DEV){
       const rand = Date.now() + '-' + crypto.randomUUID().replaceAll(/-/g, "").slice(10)
-      fetch('nodeget-theme.json?' + rand, { cache: 'no-cache' })
+      fetch('/nodeget-theme.json?' + rand, { cache: 'no-cache' })
         .then(r => {
           if (!r.ok) throw new Error(`config.json ${r.status}`)
           return r.json() as Promise<ThemeConfig>
